@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 from services.chunking import select_top_chunks
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen2.5:14b"
+MODEL_NAME = "qwen2.5:3b" #  "qwen2.5:14b"
 
 
 def _compact_text(text: str, max_chars: int = 12000) -> str:
@@ -38,9 +38,9 @@ def _ollama_chat(prompt: str, temperature: float = 0.2) -> str:
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {"temperature": temperature, "num_ctx": 4096},
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    r = requests.post(OLLAMA_URL, json=payload, timeout=900)
     r.raise_for_status()
     return r.json()["message"]["content"].strip()
 
@@ -133,47 +133,47 @@ def generate_quiz_ollama(text: str, n_questions: int = 5, language: str = "Engli
     source_text = _compact_text(source_text, max_chars=12000)
 
     prompt = f"""
-LANGUAGE: {language}
+    You are a precise quiz generator that ALWAYS outputs in the requested LANGUAGE.
 
-TASK:
-Create up to {n_questions} multiple-choice questions (MCQ) based ONLY on the SOURCE TEXT chunks.
+    TARGET LANGUAGE: {language}
+    All of the following MUST be written EXCLUSIVELY in {language}:
+    - Questions
+    - All 4 answer choices
+    - Correct answer
+    - Explanation
 
-STRICT RULES (VERY IMPORTANT):
-- Use ONLY information from the SOURCE TEXT.
-- Each question must have exactly 4 answer choices.
-- Each choice MUST be a full text answer (at least 3 characters), NOT just "A", "B", "C", "D".
-- Do NOT output letter labels as choices.
-- correct_answer MUST be the full text of the correct option and must match one of the choices exactly.
-- Provide a short explanation grounded in the SOURCE TEXT.
-- Avoid trivial keyword presence questions; prefer concepts/definitions/understanding.
-- IMPORTANT (Step C): Add "source_chunks": an array of CHUNK numbers you used to answer (e.g., [0, 3]).
-  Only use CHUNK ids that appear in the SOURCE TEXT below.
+    If the SOURCE TEXT is in a different language (for example, English), you MUST accurately TRANSLATE the relevant concepts, facts and phrasing into {language} while preserving the original meaning. Do NOT leave any part in English unless it is a proper name or term that is commonly used in {language} in its original form.
 
-OUTPUT FORMAT:
-Return ONLY valid JSON (no markdown, no comments), exactly like:
+    STRICT RULES (follow exactly):
+    - Create up to {n_questions} multiple-choice questions based ONLY on the SOURCE TEXT.
+    - Each question must have exactly 4 full-text choices (minimum 3-4 words each, natural sentences/phrases in {language}).
+    - NEVER use just "A", "B", "C", "D" as choices — always write the full text.
+    - "correct_answer" must be the FULL TEXT of one of the choices — exactly matching.
+    - Explanation must be short (2-4 sentences), in {language}, and reference specific parts of the SOURCE TEXT.
+    - For each question add "source_chunks": [list of chunk IDs you actually used].
+    - Output ONLY valid JSON array — no extra text, no markdown, no explanations outside JSON.
 
-[
-  {{
-    "question": "Full question text",
-    "choices": ["Option 1 text", "Option 2 text", "Option 3 text", "Option 4 text"],
-    "correct_answer": "Option 2 text",
-    "explanation": "Short explanation based on the SOURCE TEXT",
-    "source_chunks": [0, 2]
-  }}
-]
+    EXAMPLES of good output style (in the target language):
+    - If language=Russian: вопрос на русском, варианты на русском, объяснение на русском.
+    - Do NOT mix languages in one question.
 
-SOURCE TEXT:
-{source_text}
-""".strip()
+    SOURCE TEXT (chunks with IDs):
+    {source_text}
+    """.strip()
 
     # First attempt
-    raw = _ollama_chat(prompt, temperature=0.2)
+    raw = _ollama_chat(prompt, temperature=0.1)
     data = _extract_json_array(raw)
     quiz, needs_retry = _validate_quiz(data, n_questions, allowed_chunk_ids)
 
     # Retry once if needed (force compliance)
     if needs_retry or len(quiz) < max(1, n_questions // 2):
-        retry_prompt = prompt + "\n\nFINAL REMINDER: choices must be real text options (not A/B/C/D) and include source_chunks."
+        retry_prompt = prompt + f"""
+        CRITICAL REMINDER:
+        - EVERYTHING (questions, choices, correct_answer, explanation) MUST be in {language} only.
+        - If source is English → translate accurately to {language}.
+        - Choices MUST be full meaningful phrases in {language}, never single letters.
+        """
         raw2 = _ollama_chat(retry_prompt, temperature=0.0)
         data2 = _extract_json_array(raw2)
         quiz2, _ = _validate_quiz(data2, n_questions, allowed_chunk_ids)
