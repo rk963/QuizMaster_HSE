@@ -6,10 +6,8 @@ import streamlit as st
 
 from services.grader import grade_quiz
 from services.ingest import extract_text
-from services.quiz_generator_ollama import (
-    GenerationStoppedError,
-    generate_quiz_ollama,
-)
+from services.quiz_generator_ollama import GenerationStoppedError
+from agents.orchestrator import run_quiz_pipeline
 
 st.set_page_config(
     page_title="QuizMaster",
@@ -514,6 +512,8 @@ hr {
 # ---------------------- Session state ----------------------
 defaults = {
     "text": "",
+    "file_bytes": None,
+    "file_name": None,
     "quiz": [],
     "answers": {},
     "submitted": False,
@@ -542,7 +542,13 @@ def _clear_generation_state():
     st.session_state.generation_stop_event = None
 
 
-def _start_generation(text: str, n_questions: int, language_code: str):
+def _set_active_text(text: str, file_bytes=None, file_name=None):
+    st.session_state.text = text
+    st.session_state.file_bytes = file_bytes
+    st.session_state.file_name = file_name
+
+
+def _start_generation(text: str, n_questions: int, language_code: str, file_bytes=None):
     _reset_quiz_state()
     st.session_state.generation_status = None
     st.session_state.generation_message = ""
@@ -550,13 +556,16 @@ def _start_generation(text: str, n_questions: int, language_code: str):
     result_queue: queue.Queue = queue.Queue()
     stop_event = threading.Event()
 
+    _file_bytes = file_bytes
+
     def worker():
         try:
-            quiz = generate_quiz_ollama(
+            quiz = run_quiz_pipeline(
                 text=text,
                 n_questions=n_questions,
                 language=language_code,
                 stop_event=stop_event,
+                file_bytes=_file_bytes,
             )
 
             if stop_event.is_set():
@@ -695,10 +704,10 @@ with st.sidebar:
     T = LANGS[st.session_state.ui_language]
 
     st.markdown(f"**{T['format']}:** {T['russian_only_mode']}")
-    st.markdown(f"**{T['model']}:** Ollama / Qwen")
+    st.markdown("**{0}:** Ollama / Qwen".format(T["model"]))
     st.divider()
 
-    n_questions = st.slider(T["question_count"], min_value=3, max_value=10, value=5)
+    n_questions = st.slider(T["question_count"], min_value=1, max_value=10, value=5)
 
     st.divider()
     st.markdown(f"### {T['upload_types']}")
@@ -798,18 +807,38 @@ with col_info:
     )
 
 text = ""
+file_bytes = None
+active_file_name = None
 
+# Priority: uploaded file > pasted text
 if uploaded is not None:
     try:
-        text = extract_text(uploaded.name, uploaded.getvalue())
+        raw_bytes = uploaded.getvalue()
+
+        # Reuse cached extraction ONLY if both filename and file bytes are identical.
+        same_name = st.session_state.file_name == uploaded.name
+        same_bytes = st.session_state.file_bytes == raw_bytes
+
+        if same_name and same_bytes and st.session_state.text:
+            text = st.session_state.text
+            file_bytes = st.session_state.file_bytes
+            active_file_name = st.session_state.file_name
+        else:
+            text = extract_text(uploaded.name, raw_bytes)
+            file_bytes = raw_bytes
+            active_file_name = uploaded.name
+
         st.success(f"{T['file_success']} {uploaded.name}")
     except Exception as e:
         st.error(f"{T['file_error']} {e}")
+
 elif manual_text.strip():
     text = manual_text.strip()
+    file_bytes = None
+    active_file_name = None
 
 if text.strip():
-    st.session_state.text = text
+    _set_active_text(text=text, file_bytes=file_bytes, file_name=active_file_name)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -871,7 +900,12 @@ if st.session_state.text.strip():
         )
 
     if generate_clicked:
-        _start_generation(st.session_state.text, n_questions, T["code"])
+        _start_generation(
+            st.session_state.text,
+            n_questions,
+            T["code"],
+            file_bytes=st.session_state.file_bytes,
+        )
         st.rerun()
 
     if stop_clicked and st.session_state.generation_stop_event is not None:
@@ -979,5 +1013,5 @@ else:
     )
 
 if st.session_state.is_generating:
-    time.sleep(1.0)
+    time.sleep(0.5)
     st.rerun()

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -7,17 +8,16 @@ import requests
 
 from services.chunking import select_top_chunks
 
+
 class GenerationStoppedError(Exception):
     """Raised when quiz generation is manually stopped."""
     pass
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen2.5:14b"
+
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 
 MAX_QUESTIONS = 10  # hard cap enforced in generate_quiz_ollama()
-
-
-class GenerationStoppedError(Exception):
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +106,13 @@ def _ollama_chat(
     prompt: str,
     temperature: float = 0.2,
     stop_event: Optional[Event] = None,
+    model_name: Optional[str] = None,
+    num_ctx: int = 8192,
+    num_predict: int = 3072,
+    timeout: int = 900,
 ) -> str:
     payload = {
-        "model": MODEL_NAME,
+        "model": model_name or MODEL_NAME,
         "messages": [
             {
                 "role": "system",
@@ -124,8 +128,8 @@ def _ollama_chat(
         "options": {
             "temperature": temperature,
             "top_p": 0.9,
-            "num_ctx": 8192,
-            "num_predict": 3072,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict,
         },
     }
 
@@ -133,7 +137,7 @@ def _ollama_chat(
 
     output_parts: List[str] = []
 
-    with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=900) as response:
+    with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=timeout) as response:
         response.raise_for_status()
 
         for line in response.iter_lines(decode_unicode=True):
@@ -174,6 +178,7 @@ def _validate_quiz(
     """
     Validate model output and return (new_valid_questions, needs_retry).
     Applies both exact-key dedup and semantic (Jaccard) dedup.
+    Also rejects questions that are not grounded in allowed source chunks.
     """
     if not isinstance(items, list):
         raise ValueError("Model output is not a list.")
@@ -183,6 +188,7 @@ def _validate_quiz(
 
     for it in items:
         if not isinstance(it, dict):
+            needs_retry = True
             continue
 
         q = str(it.get("question", "")).strip()
@@ -230,7 +236,7 @@ def _validate_quiz(
             needs_retry = True
             continue
 
-        # ---- source chunks ----
+        # ---- source chunks grounding ----
         source_chunks = it.get("source_chunks", [])
         if not isinstance(source_chunks, list):
             source_chunks = []
@@ -245,6 +251,11 @@ def _validate_quiz(
                     seen_ids.add(xi)
             except Exception:
                 continue
+
+        # Reject ungrounded questions
+        if not normalized_chunks:
+            needs_retry = True
+            continue
 
         # Keep explanation compact
         if len(explanation) > 240:
@@ -288,6 +299,13 @@ ALREADY GENERATED QUESTIONS — do NOT repeat, rephrase, or paraphrase ANY of th
 Each new question MUST cover a DIFFERENT fact, concept, or detail from the source text.
 """
 
+    grounding_rules = """
+10. Use ONLY information explicitly present in the SOURCE TEXT.
+11. Do NOT invent facts, names, dates, definitions, or explanations not supported by the SOURCE TEXT.
+12. For every question, source_chunks must contain at least one valid chunk ID from the provided source.
+13. Do NOT create generic world-knowledge questions. Every question must be grounded in the provided source.
+"""
+
     if language == "Russian":
         return f"""
 You are a precise quiz generator that ALWAYS outputs in the requested LANGUAGE.
@@ -308,6 +326,7 @@ STRICT RULES:
 7. Include "source_chunks": [list of integer chunk IDs used] for each question.
 8. Output ONLY a valid JSON array — no markdown fences, no extra text before or after.
 9. Questions must be clear, factual, and directly answerable from the source.
+{grounding_rules}
 {already_used}
 OUTPUT FORMAT:
 [
@@ -343,6 +362,7 @@ STRICT RULES:
 7. Include "source_chunks": [list of integer chunk IDs used] for each question.
 8. Output ONLY a valid JSON array — no markdown fences, no extra text before or after.
 9. Questions must be clear, factual, and directly answerable from the source.
+{grounding_rules}
 {already_used}
 OUTPUT FORMAT:
 [
@@ -361,31 +381,70 @@ SOURCE TEXT (chunks with IDs):
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Source preparation helpers
 # ---------------------------------------------------------------------------
 
-def generate_quiz_ollama(
+def prepare_generation_source(
     text: str,
-    n_questions: int = 5,
-    language: str = "English",
-    stop_event: Optional[Event] = None,
-) -> List[Dict[str, Any]]:
-    _check_stop(stop_event)
-
-    n_questions = min(n_questions, MAX_QUESTIONS)
-
+    n_questions: int,
+    top_k: Optional[int] = None,
+    max_source_chars: Optional[int] = None,
+) -> Tuple[str, Set[int], List[Tuple[int, str]]]:
+    """
+    Prepare compact source text plus allowed chunk IDs.
+    Useful for multi-agent pipelines where retrieval happens before generation.
+    """
+    n_questions = min(max(1, int(n_questions)), MAX_QUESTIONS)
     query_seed = text[:400]
-    top_chunks = select_top_chunks(text, query_seed, top_k=max(8, n_questions + 3))
+
+    effective_top_k = top_k if top_k is not None else max(6, n_questions + 2)
+    top_chunks = select_top_chunks(text, query_seed, top_k=effective_top_k)
 
     allowed_chunk_ids = {idx for idx, _ in top_chunks}
     source_text = "\n\n---\n\n".join(f"CHUNK {idx}:\n{ch}" for idx, ch in top_chunks)
-    source_text = _compact_text(source_text, max_chars=min(14400, 1600 * n_questions))
+
+    effective_max_chars = (
+        max_source_chars
+        if max_source_chars is not None
+        else min(14400, 1600 * n_questions)
+    )
+    source_text = _compact_text(source_text, max_chars=effective_max_chars)
+
+    return source_text, allowed_chunk_ids, top_chunks
+
+
+# ---------------------------------------------------------------------------
+# Core generation from prepared source
+# ---------------------------------------------------------------------------
+
+def generate_quiz_from_source_text(
+    source_text: str,
+    n_questions: int = 5,
+    language: str = "English",
+    stop_event: Optional[Event] = None,
+    allowed_chunk_ids: Optional[Set[int]] = None,
+    existing_question_keys: Optional[Set[str]] = None,
+    existing_questions_text: Optional[List[str]] = None,
+    temperature_schedule: Optional[List[float]] = None,
+    model_name: Optional[str] = None,
+    num_ctx: int = 8192,
+    num_predict: int = 3072,
+    timeout: int = 900,
+) -> List[Dict[str, Any]]:
+    """
+    Generate quiz from already-prepared source text.
+    Best entry point for multi-agent pipelines.
+    """
+    _check_stop(stop_event)
+
+    n_questions = min(max(1, int(n_questions)), MAX_QUESTIONS)
+    allowed_chunk_ids = allowed_chunk_ids or set()
+    existing_question_keys = existing_question_keys or set()
+    existing_questions_text = list(existing_questions_text or [])
 
     final_quiz: List[Dict[str, Any]] = []
-    existing_question_keys: Set[str] = set()
 
-    # Rising temperature schedule: start focused, increase to get variety on retries
-    temp_schedule = [0.2, 0.35, 0.5, 0.65]
+    temp_schedule = temperature_schedule or [0.2, 0.35, 0.5, 0.65]
 
     for temperature in temp_schedule:
         _check_stop(stop_event)
@@ -394,17 +453,25 @@ def generate_quiz_ollama(
         if remaining <= 0:
             break
 
-        existing_questions_text = [q["question"] for q in final_quiz]
+        current_existing_questions = existing_questions_text + [q["question"] for q in final_quiz]
 
         prompt = _build_prompt(
             source_text=source_text,
             language=language,
             n_questions=remaining,
-            existing_questions=existing_questions_text,
+            existing_questions=current_existing_questions,
         )
 
         try:
-            raw = _ollama_chat(prompt, temperature=temperature, stop_event=stop_event)
+            raw = _ollama_chat(
+                prompt,
+                temperature=temperature,
+                stop_event=stop_event,
+                model_name=model_name,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                timeout=timeout,
+            )
             data = _extract_json_array(raw)
         except GenerationStoppedError:
             raise
@@ -416,7 +483,7 @@ def generate_quiz_ollama(
             n_questions=remaining,
             allowed_chunk_ids=allowed_chunk_ids,
             existing_question_keys=existing_question_keys,
-            existing_questions_text=existing_questions_text,
+            existing_questions_text=current_existing_questions,
         )
 
         final_quiz.extend(new_questions)
@@ -431,3 +498,72 @@ def generate_quiz_ollama(
         q["id"] = i
 
     return final_quiz[:n_questions]
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def generate_quiz_ollama(
+    text: str,
+    n_questions: int = 5,
+    language: str = "English",
+    stop_event: Optional[Event] = None,
+    *,
+    source_text: Optional[str] = None,
+    allowed_chunk_ids: Optional[Set[int]] = None,
+    existing_question_keys: Optional[Set[str]] = None,
+    existing_questions_text: Optional[List[str]] = None,
+    temperature_schedule: Optional[List[float]] = None,
+    use_internal_retrieval: bool = True,
+    top_k: Optional[int] = None,
+    max_source_chars: Optional[int] = None,
+    model_name: Optional[str] = None,
+    num_ctx: int = 8192,
+    num_predict: int = 3072,
+    timeout: int = 900,
+) -> List[Dict[str, Any]]:
+    """
+    Backward-compatible public function.
+
+    Old usage:
+        generate_quiz_ollama(text=raw_text, ...)
+
+    Multi-agent usage:
+        generate_quiz_ollama(
+            text=raw_text,
+            source_text=prepared_source,
+            allowed_chunk_ids=allowed_ids,
+            use_internal_retrieval=False,
+            ...
+        )
+    """
+    _check_stop(stop_event)
+
+    n_questions = min(max(1, int(n_questions)), MAX_QUESTIONS)
+
+    prepared_source_text = source_text
+    prepared_allowed_chunk_ids = allowed_chunk_ids
+
+    if prepared_source_text is None or (use_internal_retrieval and prepared_allowed_chunk_ids is None):
+        prepared_source_text, prepared_allowed_chunk_ids, _ = prepare_generation_source(
+            text=text,
+            n_questions=n_questions,
+            top_k=top_k,
+            max_source_chars=max_source_chars,
+        )
+
+    return generate_quiz_from_source_text(
+        source_text=prepared_source_text,
+        n_questions=n_questions,
+        language=language,
+        stop_event=stop_event,
+        allowed_chunk_ids=prepared_allowed_chunk_ids or set(),
+        existing_question_keys=existing_question_keys,
+        existing_questions_text=existing_questions_text,
+        temperature_schedule=temperature_schedule,
+        model_name=model_name,
+        num_ctx=num_ctx,
+        num_predict=num_predict,
+        timeout=timeout,
+    )
