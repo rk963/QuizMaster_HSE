@@ -1,3 +1,4 @@
+
 import queue
 import threading
 import time
@@ -8,6 +9,7 @@ from services.grader import grade_quiz
 from services.ingest import extract_text
 from services.quiz_generator_ollama import GenerationStoppedError
 from agents.orchestrator import run_quiz_pipeline
+from storage.db import clear_chunk_cache
 
 st.set_page_config(
     page_title="QuizMaster",
@@ -83,6 +85,8 @@ LANGS = {
         "question_count": "Количество вопросов",
         "lang_label": "Язык интерфейса и теста",
         "russian_only_mode": "Русский / English",
+        "clear_cache_btn": "🗑 Очистить кэш", 
+        "cache_cleared": "Кэш успешно очищен.",
     },
     "English": {
         "code": "English",
@@ -149,6 +153,8 @@ LANGS = {
         "question_count": "Number of questions",
         "lang_label": "Interface and quiz language",
         "russian_only_mode": "Russian / English",
+        "clear_cache_btn": "🗑 Clear cache",
+        "cache_cleared": "Cache cleared successfully.",
     },
 }
 
@@ -708,6 +714,12 @@ with st.sidebar:
     st.divider()
 
     n_questions = st.slider(T["question_count"], min_value=1, max_value=10, value=5)
+    
+    if st.button(T["clear_cache_btn"], use_container_width=True):
+        clear_chunk_cache()
+        st.session_state.file_bytes = None
+        st.session_state.file_name = None
+        st.success(T["cache_cleared"])
 
     st.divider()
     st.markdown(f"### {T['upload_types']}")

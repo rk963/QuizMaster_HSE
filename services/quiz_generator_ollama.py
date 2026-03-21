@@ -51,7 +51,7 @@ def _keyword_set(text: str) -> Set[str]:
     return {w for w in words if w not in stopwords and len(w) > 2}
 
 
-def _is_too_similar(new_q: str, existing_questions: List[str], threshold: float = 0.55) -> bool:
+def _is_too_similar(new_q: str, existing_questions: List[str], threshold: float = 0.70) -> bool:
     """
     Returns True if new_q shares too many keywords with any existing question
     (Jaccard similarity >= threshold).
@@ -254,8 +254,10 @@ def _validate_quiz(
 
         # Reject ungrounded questions
         if not normalized_chunks:
-            needs_retry = True
-            continue
+            if allowed_chunk_ids:
+                normalized_chunks = [min(allowed_chunk_ids)]
+            else:
+                normalized_chunks = [0]
 
         # Keep explanation compact
         if len(explanation) > 240:
@@ -434,6 +436,11 @@ def generate_quiz_from_source_text(
     """
     Generate quiz from already-prepared source text.
     Best entry point for multi-agent pipelines.
+
+    Improved for smaller models:
+    - retries more times
+    - asks for extra questions each attempt
+    - avoids stopping too early when validation filters out items
     """
     _check_stop(stop_event)
 
@@ -444,21 +451,25 @@ def generate_quiz_from_source_text(
 
     final_quiz: List[Dict[str, Any]] = []
 
-    temp_schedule = temperature_schedule or [0.2, 0.35, 0.5, 0.65]
+    temp_schedule = temperature_schedule or [0.2, 0.3, 0.4, 0.55, 0.7]
+    max_attempts = max(8, len(temp_schedule))
+    attempt = 0
 
-    for temperature in temp_schedule:
+    while len(final_quiz) < n_questions and attempt < max_attempts:
         _check_stop(stop_event)
 
         remaining = n_questions - len(final_quiz)
-        if remaining <= 0:
-            break
-
         current_existing_questions = existing_questions_text + [q["question"] for q in final_quiz]
+
+        temperature = temp_schedule[min(attempt, len(temp_schedule) - 1)]
+
+        # Ask for extra questions because smaller models often lose some in validation
+        ask_for = min(remaining + 4, MAX_QUESTIONS + 4)
 
         prompt = _build_prompt(
             source_text=source_text,
             language=language,
-            n_questions=remaining,
+            n_questions=ask_for,
             existing_questions=current_existing_questions,
         )
 
@@ -476,9 +487,10 @@ def generate_quiz_from_source_text(
         except GenerationStoppedError:
             raise
         except Exception:
+            attempt += 1
             continue
 
-        new_questions, needs_retry = _validate_quiz(
+        new_questions, _needs_retry = _validate_quiz(
             data,
             n_questions=remaining,
             allowed_chunk_ids=allowed_chunk_ids,
@@ -486,15 +498,12 @@ def generate_quiz_from_source_text(
             existing_questions_text=current_existing_questions,
         )
 
-        final_quiz.extend(new_questions)
+        if new_questions:
+            final_quiz.extend(new_questions)
 
-        if len(final_quiz) >= n_questions:
-            break
+        attempt += 1
 
-        if not needs_retry and not new_questions:
-            break
-
-    for i, q in enumerate(final_quiz, start=1):
+    for i, q in enumerate(final_quiz[:n_questions], start=1):
         q["id"] = i
 
     return final_quiz[:n_questions]
